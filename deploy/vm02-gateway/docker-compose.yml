@@ -1,0 +1,34 @@
+services:
+  gateway-core:
+    build:
+      context: ../../gateway-core
+    container_name: gateway-core
+    restart: unless-stopped
+    env_file:
+      - .env
+    ports:
+      - "10.10.10.1:8000:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health')"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+    networks:
+      - gateway-net
+
+  nginx:
+    build:
+      context: ../../gateway-proxy
+    container_name: gateway-proxy
+    restart: unless-stopped
+    depends_on:
+      gateway-core:
+        condition: service_healthy
+    ports:
+      - "10.10.10.1:8080:8080"
+    networks:
+      - gateway-net
+
+networks:
+  gateway-net:
+    driver: bridge
