@@ -9,6 +9,7 @@ import psycopg
 import pymupdf
 import redis
 from docx import Document
+from underthesea import ner as vi_ner
 from openpyxl import load_workbook
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from pydantic import BaseModel
@@ -51,9 +52,57 @@ class InspectRequest(BaseModel):
     text: str
 
 
+def _ner_entities(text: str):
+    """Return Vietnamese PER/ORG/LOC entity surfaces from local NER."""
+    labels = {"PER", "ORG", "LOC"}
+    entities = []
+    current_label = None
+    current_words = []
+
+    def flush():
+        nonlocal current_label, current_words
+        surface = " ".join(current_words).strip()
+        if current_label and surface:
+            entities.append((current_label, surface))
+        current_label = None
+        current_words = []
+
+    for item in vi_ner(text):
+        if isinstance(item, dict):
+            word = str(item.get("word", "")).strip()
+            tag = str(item.get("entity", "O"))
+        elif isinstance(item, (tuple, list)) and item:
+            word = str(item[0]).strip()
+            tag = str(item[-1])
+        else:
+            flush()
+            continue
+
+        if not word or "-" not in tag:
+            flush()
+            continue
+
+        prefix, label = tag.split("-", 1)
+        if label not in labels or prefix not in {"B", "I"}:
+            flush()
+            continue
+
+        if prefix == "B" or current_label != label:
+            flush()
+            current_label = label
+            current_words = [word]
+        else:
+            current_words.append(word)
+
+    flush()
+    return entities
+
+
 def mask(text: str):
     findings = []
     masked = text
+
+    # Structured identifiers first; preserve the existing regex DLP behavior.
     for name, pattern in PATTERNS.items():
         matches = list(pattern.finditer(masked))
         if not matches:
@@ -61,7 +110,6 @@ def mask(text: str):
 
         findings.append({"type": name, "count": len(matches)})
         if name == "cccd":
-            # Preserve the label/context and replace only the ID number.
             masked = pattern.sub(
                 lambda match: match.group(0).replace(
                     match.group("number"), REPLACEMENTS[name]
@@ -70,8 +118,43 @@ def mask(text: str):
             )
         else:
             masked = pattern.sub(REPLACEMENTS[name], masked)
-    return masked, findings
 
+    # NER runs locally on VM03. Only entity spans found in the remaining text
+    # are replaced; original text is not sent to the NER provider or Gemini.
+    ner_replacements = {
+        "PER": ("person_name", "[PERSON]"),
+        "ORG": ("organization", "[ORGANIZATION]"),
+        "LOC": ("location", "[LOCATION]"),
+    }
+    counts = {}
+    seen = set()
+
+    for label, surface in _ner_entities(masked):
+        key = (label, surface.casefold())
+        if key in seen:
+            continue
+        seen.add(key)
+
+        parts = [re.escape(part) for part in surface.split()]
+        if not parts:
+            continue
+        pattern = re.compile(
+            r"(?<!\w)" + r"\s+".join(parts) + r"(?!\w)",
+            re.IGNORECASE,
+        )
+        matches = list(pattern.finditer(masked))
+        if not matches:
+            continue
+
+        finding_type, replacement = ner_replacements[label]
+        counts[finding_type] = counts.get(finding_type, 0) + len(matches)
+        masked = pattern.sub(replacement, masked)
+
+    findings.extend(
+        {"type": finding_type, "count": count}
+        for finding_type, count in counts.items()
+    )
+    return masked, findings
 
 def extract_file_text(extension: str, data: bytes) -> str:
     if extension == ".txt":
